@@ -8,7 +8,9 @@ I bought an Echelon EX-3 instead of a higher-end model to save money thinking I 
 * Total rotations
 
 ## Prerequisites & Hardware
-1. Get a **"CYD" (Cheap Yellow Display)** ESP32 device with a 2.8-inch screen (e.g., [AliExpress Link](https://www.aliexpress.us/item/3256804785406072.html)).
+1. Get a **"CYD" (Cheap Yellow Display)** ESP32 device:
+   - Either the standard **2.8-inch screen** (resistive touch, ILI9341 display driver).
+   - Or the larger **3.5-inch screen** (capacitive touch, ST7796 display driver).
 2. An ESP32-compatible development environment (Arduino IDE or Arduino CLI).
 
 ---
