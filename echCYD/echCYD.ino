@@ -80,7 +80,7 @@ TFT_eSPI tft = TFT_eSPI();
 #endif
 
 // --- Debug Flag ---
-#define UI_DEBUG 
+// #define UI_DEBUG 
 
 // --- BLE Globals ---
 static BLEUUID serviceUUID("0bf669f1-45f2-11e7-9598-0800200c9a66"); 
