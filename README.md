@@ -18,12 +18,7 @@ I bought an Echelon EX-3 instead of a higher-end model to save money thinking I 
 ## Setup Instructions
 
 ### 1. Sketch Directory Structure
-Arduino requires the main `.ino` file to reside in a folder with the exact same name.
-* Move `cyd.ino` into a subfolder named `cyd`, or create a symlink:
-  ```bash
-  mkdir -p cyd
-  ln -s ../cyd.ino cyd/cyd.ino
-  ```
+Arduino requires the main `.ino` file to reside in a folder with the exact same name. This repository is already structured with the main sketch file (`echCYD.ino`) inside the `echCYD` folder.
 
 ### 2. Install Board Support
 Ensure you have the ESP32 board platform installed.
@@ -67,17 +62,17 @@ With your CYD device connected:
 * **Arduino CLI**:
   ```bash
   # Compile the sketch
-  arduino-cli compile --fqbn esp32:esp32:esp32 cyd
+  arduino-cli compile --fqbn esp32:esp32:esp32 echCYD
   
   # Upload the sketch (replace /dev/ttyUSB0 with your actual port)
-  arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 cyd
+  arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 echCYD
   ```
 
 ---
 
 ## UI Debug / Simulation Mode
 
-By default, the code has UI debug mode enabled near the top of [cyd.ino](file:///home/eli/git/echCYD/cyd.ino):
+By default, the code has UI debug mode enabled near the top of [echCYD.ino](file:///home/eli/git/echCYD/echCYD/echCYD.ino):
 ```cpp
 #define UI_DEBUG
 ```
