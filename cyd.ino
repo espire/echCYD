@@ -1,20 +1,56 @@
 #include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
 
-// --- Screen Setup ---
-TFT_eSPI tft = TFT_eSPI();
+// --- Hardware Pins ---
+#define XPT2046_IRQ  36
+#define XPT2046_MOSI 32
+#define XPT2046_MISO 39
+#define XPT2046_CLK  25
+#define XPT2046_CS   33
+#define BUZZER_PIN   26
+#define TFT_BL       21
 
-// --- Echelon BLE Setup ---
+// --- UI Constants ---
+#define COLOR_BG      TFT_BLACK
+#define COLOR_PANEL   0x2104 
+#define COLOR_TEXT    TFT_LIGHTGREY
+#define COLOR_RES     TFT_YELLOW
+#define COLOR_CAD     TFT_CYAN
+#define COLOR_WATTS   TFT_ORANGE
+#define COLOR_KCAL    TFT_MAGENTA
+#define COLOR_DIST    0x07FF // Cyan/Blue
+#define COLOR_TIME    TFT_WHITE
+#define BTN_UP_COLOR   0x03E0 
+#define BTN_DOWN_COLOR 0xA000 
+
+#define SLEEP_TIMEOUT  300000 
+#define TS_MINX 200
+#define TS_MAXX 3700
+#define TS_MINY 200
+#define TS_MAXY 3600
+
+// --- System State ---
+enum SystemState { STATE_SLEEP, STATE_DISCONNECTED, STATE_CONNECTED };
+SystemState currentState = STATE_DISCONNECTED;
+unsigned long lastActivityTime = 0;
+
+TFT_eSPI tft = TFT_eSPI();
+SPIClass touchSPI = SPIClass(HSPI);
+XPT2046_Touchscreen touch(XPT2046_CS, XPT2046_IRQ);
+
+// --- Debug Flag ---
+#define UI_DEBUG 
+
+// --- BLE Globals ---
 static BLEUUID serviceUUID("0bf669f1-45f2-11e7-9598-0800200c9a66"); 
 static BLEUUID writeCharUUID("0bf669f2-45f2-11e7-9598-0800200c9a66");  
 static BLEUUID notifyCharUUID("0bf669f4-45f2-11e7-9598-0800200c9a66"); 
-
 static boolean doConnect = false;
 static boolean connected = false;
-static boolean doScan = true;
-
+static boolean doScan = false;
 static BLEAddress* pServerAddress = nullptr;
 static BLERemoteCharacteristic* pRemoteNotifyCharacteristic;
 static BLERemoteCharacteristic* pRemoteWriteCharacteristic;
@@ -23,110 +59,181 @@ BLEClient* pClient;
 // --- Live Metrics ---
 int currentCadence = 0;
 int currentResistance = 0;
+float currentWatts = 0;
+float displayWatts = 0;
+float throttledWatts = 0;
+float throttledKcals = 0.0;
+float throttledMiles = 0.0;
+float totalMiles = 0.0;
+float totalKJ = 0.0; 
 
-// Integration variables for Total Rotations
-int totalRotations = 0;
-float fractionalRotations = 0.0;
-unsigned long lastRotCalcTime = 0;
+#define AVG_WINDOW 100
+float wattsBuffer[AVG_WINDOW];
+int bufferIndex = 0;
+double wattsSum = 0;
+
+unsigned long lastPowerCalcTime = 0;
+unsigned long lastWattsUpdateMillis = 0;
+unsigned long workoutStartTime = 0;
 
 // Flicker filters
 int lastCadence = -1;
 int lastResistance = -1;
-int lastRotations = -1;
+float lastThrottledWatts = -1.0;
+uint16_t lastWattsColor = 0;
+float lastKcals = -1.0;
+float lastMiles = -1.0;
 String lastStatus = "";
+String lastTimeStr = "";
 
-// --- UI Functions ---
-void drawStaticUI() {
+// --- Helpers ---
+uint16_t getPowerColor(float watts) {
+  if (watts < 100.0) return TFT_CYAN;   
+  if (watts < 200.0) return TFT_GREEN;  
+  if (watts < 300.0) return TFT_YELLOW; 
+  return TFT_RED;                      
+}
+
+void beep(int freq, int duration = 20) {
+  tone(BUZZER_PIN, freq, duration);
+}
+
+void drawButton(int x, int y, int w, int h, String label, uint16_t color, bool pressed) {
+  uint16_t fill = pressed ? TFT_WHITE : color;
+  uint16_t text = pressed ? color : TFT_WHITE;
+  tft.fillRoundRect(x, y, w, h, 8, fill);
+  tft.drawRoundRect(x, y, w, h, 8, TFT_WHITE);
+  tft.setTextColor(text);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(label, x + (w/2), y + (h/2), 4);
+}
+
+void drawConnectScreen() {
   tft.fillScreen(TFT_BLACK);
-  
-  // Headers
-  tft.setTextColor(TFT_LIGHTGREY);
-  tft.setTextSize(2);
-  tft.setCursor(20, 40);  tft.print("RESISTANCE");
-  
-  // Shifted left from 180 to 160 to prevent text wrapping
-  tft.setCursor(160, 40); tft.print("CADENCE");
-  tft.setCursor(160, 140); tft.print("ROTATIONS");
-
-  // Draw the Touch Shifter Buttons vertically under Resistance
-  tft.fillRect(20, 115, 80, 50, TFT_DARKGREEN); // Up Button
-  tft.fillRect(20, 175, 80, 50, TFT_RED);       // Down Button
-  
   tft.setTextColor(TFT_WHITE);
-  tft.setTextSize(4); 
-  tft.setCursor(45, 125); tft.print("+");
-  tft.setCursor(45, 185); tft.print("-");
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("ECHELON CONSOLE", 160, 60, 4);
+  drawButton(30, 110, 260, 70, "START WORKOUT", 0x001F, false); 
+  tft.setTextColor(TFT_DARKGREY);
+  tft.drawString("Tap to connect to bike", 160, 200, 2);
+}
+
+void drawStaticUI() {
+  tft.fillScreen(COLOR_BG);
+  tft.drawFastVLine(106, 40, 200, 0x4208); 
+  tft.drawFastVLine(212, 40, 200, 0x4208); 
+  tft.setTextColor(COLOR_TEXT);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("RESISTANCE", 53, 50, 2);
+  tft.drawString("CADENCE", 159, 50, 2);
+  tft.drawString("WATTS", 265, 50, 2);
+  tft.drawString("KCAL", 159, 160, 2);
+  tft.drawString("MILES", 265, 160, 2);
+  drawButton(15, 140, 76, 40, "+", BTN_UP_COLOR, false);
+  drawButton(15, 190, 76, 40, "-", BTN_DOWN_COLOR, false);
+  tft.fillRect(250, 2, 60, 26, TFT_RED);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawString("STOP", 280, 15, 2);
 }
 
 void updateDashboard(String statusMsg) {
-  // Only redraw status bar if it changes
-  if (statusMsg != lastStatus) {
-    tft.fillRect(0, 0, 320, 30, TFT_DARKGREY); 
-    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-    tft.setTextSize(2);
-    tft.setCursor(10, 5);
-    tft.print(statusMsg); 
+  if (currentState != STATE_CONNECTED && statusMsg != "CONNECTING...") return;
+
+  unsigned long elapsed = 0;
+  if (workoutStartTime > 0) elapsed = (millis() - workoutStartTime) / 1000;
+  int h = elapsed / 3600, m = (elapsed % 3600) / 60, s = elapsed % 60;
+  char tBuf[10];
+  if (h > 0) sprintf(tBuf, "%d:%02d:%02d", h, m, s);
+  else sprintf(tBuf, "%02d:%02d", m, s);
+  String timeStr = String(tBuf);
+
+  if (statusMsg != lastStatus || timeStr != lastTimeStr) {
+    tft.fillRect(0, 0, 248, 30, COLOR_PANEL); 
+    tft.setTextColor(TFT_WHITE);
+    tft.setTextDatum(ML_DATUM); 
+    tft.drawString(statusMsg, 10, 15, 2); 
+    tft.setTextDatum(MR_DATUM);
+    tft.drawString(timeStr, 240, 15, 2);
     lastStatus = statusMsg;
+    lastTimeStr = timeStr;
   }
 
-  // Draw Dynamic Numbers using opaque background (TFT_BLACK) to prevent flickering
-  tft.setTextSize(6); 
+  if (currentState != STATE_CONNECTED) return;
+  tft.setTextDatum(MC_DATUM);
   
-  // Resistance Value
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.setCursor(20, 65);
-  tft.printf("%02d", currentResistance); 
-
-  // Cadence Value (shifted left)
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setCursor(160, 65);
-  tft.printf("%03d", currentCadence); 
-
-  // Total Rotations Value (shifted left)
-  tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
-  tft.setCursor(160, 165);
-  tft.printf("%04d", totalRotations); 
+  if (currentResistance != lastResistance) {
+    tft.fillRect(5, 65, 96, 50, COLOR_BG);
+    tft.setTextColor(COLOR_RES);
+    tft.drawNumber(currentResistance, 53, 90, 7); 
+    lastResistance = currentResistance;
+  }
+  if (currentCadence != lastCadence) {
+    tft.fillRect(111, 65, 96, 50, COLOR_BG);
+    tft.setTextColor(COLOR_CAD);
+    tft.drawNumber(currentCadence, 159, 90, 7); 
+    lastCadence = currentCadence;
+  }
+  uint16_t wattsColor = getPowerColor(throttledWatts);
+  if (throttledWatts != lastThrottledWatts || wattsColor != lastWattsColor) {
+    tft.fillRect(217, 65, 96, 50, COLOR_BG);
+    tft.setTextColor(wattsColor);
+    int precision = (throttledWatts < 10.0) ? 1 : 0;
+    tft.drawFloat(throttledWatts, precision, 265, 90, 7); 
+    lastThrottledWatts = throttledWatts;
+    lastWattsColor = wattsColor;
+  }
+  if (throttledKcals != lastKcals) {
+    tft.fillRect(110, 175, 98, 55, COLOR_BG);
+    tft.setTextColor(COLOR_KCAL);
+    tft.drawFloat(throttledKcals, (throttledKcals < 10.0 ? 1 : 0), 159, 205, 7); 
+    lastKcals = throttledKcals;
+  }
+  if (throttledMiles != lastMiles) {
+    tft.fillRect(216, 175, 98, 55, COLOR_BG);
+    tft.setTextColor(COLOR_DIST);
+    tft.drawFloat(throttledMiles, (throttledMiles < 10.0 ? 2 : 1), 265, 205, 7); 
+    lastMiles = throttledMiles;
+  }
 }
 
-// --- Write Command: Set Digital Resistance ---
+void setSleep(bool sleep) {
+  if (sleep) {
+    digitalWrite(TFT_BL, LOW);
+    currentState = STATE_SLEEP;
+#ifndef UI_DEBUG
+    if (connected) pClient->disconnect();
+#endif
+  } else {
+    digitalWrite(TFT_BL, HIGH);
+    currentState = STATE_DISCONNECTED;
+    drawConnectScreen();
+    lastActivityTime = millis();
+  }
+}
+
 void setResistance(int level) {
   if (level < 1) level = 1;
   if (level > 32) level = 32;
-  
-  if (pRemoteWriteCharacteristic != nullptr) {
-    uint8_t checksum = (0xF0 + 0xB1 + level) & 0xFF;
-    uint8_t packet[] = {0xF0, 0xB1, (uint8_t)level, 0x00, checksum};
+  currentResistance = level; 
+#ifndef UI_DEBUG
+  if (pRemoteWriteCharacteristic != nullptr && connected) {
+    uint8_t packet[] = {0xF0, 0xB1, 0x01, (uint8_t)level, 0x00};
+    packet[4] = packet[0] ^ packet[1] ^ packet[2] ^ packet[3];
     pRemoteWriteCharacteristic->writeValue(packet, sizeof(packet), true);
-    
-    currentResistance = level; 
   }
+#endif
 }
 
-// --- Read Command: Decode Live Data ---
 static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
-  // 1. Decode Resistance (D2 Packets)
-  if (length == 5 && pData[1] == 0xD2) {
-    currentResistance = pData[3];
-  }
-
-  // 2. Decode Cadence (D1 Packets)
-  if (length >= 11 && pData[1] == 0xD1) {
-    currentCadence = (pData[9] << 8) | pData[10];
-  }
+  if (length == 5 && pData[1] == 0xD2) currentResistance = pData[3];
+  if (length >= 11 && pData[1] == 0xD1) currentCadence = (pData[9] << 8) | pData[10];
 }
 
-// --- BLE Callbacks ---
 class MyClientCallback : public BLEClientCallbacks {
   void onConnect(BLEClient* pclient) {}
   void onDisconnect(BLEClient* pclient) {
-    connected = false;
-    Serial.println("Disconnected! Going back to scanning...");
-    doScan = true; 
-    
-    // Reset filters on disconnect so the screen updates immediately on reconnect
-    lastCadence = -1;
-    lastResistance = -1;
-    lastRotations = -1;
+    connected = false; workoutStartTime = 0; lastTimeStr = ""; totalKJ = 0; totalMiles = 0;
+    if (currentState == STATE_CONNECTED) { currentState = STATE_DISCONNECTED; drawConnectScreen(); }
   }
 };
 
@@ -134,160 +241,120 @@ class MyScanCallbacks: public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) {
     if (advertisedDevice.haveName()) {
       String deviceName = advertisedDevice.getName().c_str();
-      
       if (deviceName.indexOf("ECH") != -1) {
-        Serial.print(">>> MATCH! Found Echelon Bike! Name: ");
-        Serial.println(deviceName);
-        
-        if (pServerAddress == nullptr) {
-          pServerAddress = new BLEAddress(advertisedDevice.getAddress());
-        }
-        
-        doConnect = true;
-        doScan = false;
-        advertisedDevice.getScan()->stop();
+        if (pServerAddress == nullptr) pServerAddress = new BLEAddress(advertisedDevice.getAddress());
+        doConnect = true; doScan = false; advertisedDevice.getScan()->stop();
       }
     }
   }
 };
 
-// --- Connection Logic ---
 bool connectToServer() {
   updateDashboard("CONNECTING...");
-  Serial.print("Connecting to EX-3 at: ");
-  Serial.println(pServerAddress->toString().c_str());
-  
-  if (!pClient->connect(*pServerAddress)) {
-    return false;
-  }
-
-  pClient->setMTU(517); 
-  delay(3000); 
-
+  if (!pClient->connect(*pServerAddress)) return false;
+  pClient->setMTU(517); delay(500); 
   BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
-  if (pRemoteService == nullptr) {
-    pClient->disconnect();
-    delay(1000); 
-    return false;
-  }
-
+  if (pRemoteService == nullptr) { pClient->disconnect(); return false; }
   pRemoteWriteCharacteristic = pRemoteService->getCharacteristic(writeCharUUID);
   if (pRemoteWriteCharacteristic != nullptr) {
-    uint8_t initPacket[] = {0xF0, 0xB0, 0x01, 0x01, 0xA2}; 
+    uint8_t initPacket[] = {0xF0, 0xB0, 0x01, 0x01, 0x40}; 
     pRemoteWriteCharacteristic->writeValue(initPacket, sizeof(initPacket), true);
-    delay(500); 
+    delay(200); 
   }
-
   pRemoteNotifyCharacteristic = pRemoteService->getCharacteristic(notifyCharUUID);
-  if (pRemoteNotifyCharacteristic == nullptr) {
-    pClient->disconnect();
-    delay(1000);
-    return false;
-  }
-
-  if (pRemoteNotifyCharacteristic->canNotify()) {
-    pRemoteNotifyCharacteristic->registerForNotify(notifyCallback);
-  }
-
-  connected = true;
-  lastRotCalcTime = millis(); // Start the rotation timer
-  updateDashboard("CONNECTED");
+  if (pRemoteNotifyCharacteristic == nullptr) { pClient->disconnect(); return false; }
+  if (pRemoteNotifyCharacteristic->canNotify()) pRemoteNotifyCharacteristic->registerForNotify(notifyCallback);
+  connected = true; currentState = STATE_CONNECTED; drawStaticUI();
+  lastPowerCalcTime = millis(); workoutStartTime = millis(); lastWattsUpdateMillis = millis();
+  for(int i=0; i<AVG_WINDOW; i++) wattsBuffer[i] = 0;
+  wattsSum = 0; bufferIndex = 0; totalKJ = 0; totalMiles = 0;
+  throttledKcals = 0; throttledMiles = 0;
   return true;
 }
 
-// --- Main Setup & Loop ---
 void setup() {
   Serial.begin(115200);
-
-  tft.init();
-  tft.setRotation(1); 
-  drawStaticUI();
-  updateDashboard("INITIALIZING");
-
-  BLEDevice::init("");
-  
-  pClient = BLEDevice::createClient();
-  pClient->setClientCallbacks(new MyClientCallback());
-
-  BLEScan* pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyScanCallbacks());
-  pBLEScan->setInterval(1349);
-  pBLEScan->setWindow(449);
-  pBLEScan->setActiveScan(true);
-  
-  updateDashboard("SCANNING...");
+  pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH); pinMode(BUZZER_PIN, OUTPUT);
+  tft.init(); tft.setRotation(1); drawConnectScreen();
+  touchSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  touch.begin(touchSPI); touch.setRotation(1);
+#ifndef UI_DEBUG
+  BLEDevice::init(""); pClient = BLEDevice::createClient(); pClient->setClientCallbacks(new MyClientCallback());
+#endif
+  lastActivityTime = millis();
 }
 
 void loop() {
-  // 1. Handle Bluetooth Connection States
-  if (doConnect == true) {
-    if (!connectToServer()) {
-      updateDashboard("RETRYING...");
-      delay(3000); 
-      if (pServerAddress != nullptr) {
-        delete pServerAddress;
-        pServerAddress = nullptr;
-      }
-      doScan = true;
-    }
-    doConnect = false;
+  unsigned long currentMillis = millis();
+  if (currentState == STATE_SLEEP) {
+    if (touch.touched()) { beep(1000, 50); setSleep(false); delay(300); }
+    return; 
   }
-
-  if (doScan) {
-    BLEDevice::getScan()->start(5, false); 
-    BLEDevice::getScan()->clearResults(); 
-  }
-
-  // 2. Handle Continuous Math & UI Updates
-  if (connected) {
-    unsigned long currentMillis = millis();
-    
-    // Calculate total rotations based on elapsed time and current RPM
-    if (lastRotCalcTime > 0) {
-      unsigned long deltaT = currentMillis - lastRotCalcTime;
-      
-      // Cadence / 60,000 gives us Revolutions per Millisecond
-      fractionalRotations += (currentCadence / 60000.0) * deltaT;
-      
-      // When we hit a full rotation, roll it over to the integer display
-      if (fractionalRotations >= 1.0) {
-        int newRotations = (int)fractionalRotations;
-        totalRotations += newRotations;
-        fractionalRotations -= newRotations;
+  if (currentState == STATE_DISCONNECTED) {
+    if (touch.tirqTouched() && touch.touched()) {
+      TS_Point p = touch.getPoint();
+      uint16_t x = map(p.x, TS_MINX, TS_MAXX, 0, 320), y = map(p.y, TS_MINY, TS_MAXY, 0, 240);
+      if (x > 30 && x < 290 && y > 110 && y < 180) {
+        beep(1500, 50);
+#ifdef UI_DEBUG
+        currentCadence = 85; currentResistance = 20; connected = true; 
+        currentState = STATE_CONNECTED; drawStaticUI(); 
+        lastPowerCalcTime = millis(); workoutStartTime = millis(); lastWattsUpdateMillis = millis();
+        for(int i=0; i<AVG_WINDOW; i++) wattsBuffer[i] = 0;
+        totalKJ = 0; totalMiles = 0; throttledKcals = 0; throttledMiles = 0;
+#else
+        doScan = true; updateDashboard("SCANNING...");
+#endif
       }
+      lastActivityTime = currentMillis;
     }
-    lastRotCalcTime = currentMillis;
-
-    // Check Touch Inputs for Digital Shifting
-    uint16_t x = 0, y = 0;
-    if (tft.getTouch(&x, &y)) {
-      // Touch coordinates are mapped to the X/Y axes. 
-      // Left Column (X = 20 to 100)
-      if (x > 20 && x < 100) {
-        // Up Button bounds
-        if (y > 115 && y < 165) {
-          setResistance(currentResistance + 1);
-          delay(200); 
-        }
-        // Down Button bounds
-        if (y > 175 && y < 225) {
-          setResistance(currentResistance - 1);
-          delay(200); 
-        }
-      }
+    if (doScan) {
+      BLEDevice::getScan()->start(5, false);
+      if (doConnect) { if (!connectToServer()) { updateDashboard("RETRYING..."); delay(2000); doScan = true; } doConnect = false; }
     }
-
-    // Update screen if ANY of the three numbers changed
-    if (currentCadence != lastCadence || currentResistance != lastResistance || totalRotations != lastRotations) {
-      updateDashboard("CONNECTED");
-      lastCadence = currentCadence;
-      lastResistance = currentResistance;
-      lastRotations = totalRotations;
-    }
-  } else {
-    // If disconnected, just ensure the UI reflects it
-    updateDashboard("DISCONNECTED");
+    if (currentMillis - lastActivityTime > SLEEP_TIMEOUT) setSleep(true);
+    return;
   }
+  if (currentState == STATE_CONNECTED) {
+    currentWatts = (currentCadence * currentResistance * currentResistance) / 200.0;
+    wattsSum -= wattsBuffer[bufferIndex]; wattsBuffer[bufferIndex] = currentWatts;
+    wattsSum += currentWatts; bufferIndex = (bufferIndex + 1) % AVG_WINDOW;
+    displayWatts = wattsSum / AVG_WINDOW;
 
-  delay(20); // Small loop delay for stability
+    if (currentMillis - lastWattsUpdateMillis >= 1000) {
+      throttledWatts = displayWatts;
+      throttledKcals = totalKJ;
+      throttledMiles = totalMiles;
+      lastWattsUpdateMillis = currentMillis;
+    }
+
+    if (lastPowerCalcTime > 0) {
+      unsigned long deltaT = currentMillis - lastPowerCalcTime;
+      totalKJ += (currentWatts * deltaT) / 1000000.0;
+      float speedMPH = 1.6 * sqrt(currentWatts);
+      totalMiles += (speedMPH / 3600000.0) * deltaT;
+    }
+    lastPowerCalcTime = currentMillis;
+    if (currentCadence > 0) lastActivityTime = currentMillis;
+
+    if (touch.tirqTouched() && touch.touched()) {
+      TS_Point p = touch.getPoint();
+      uint16_t x = map(p.x, TS_MINX, TS_MAXX, 0, 320), y = map(p.y, TS_MINY, TS_MAXY, 0, 240);
+      lastActivityTime = currentMillis;
+      if (x > 15 && x < 91 && y > 140 && y < 180) {
+        beep(2000); drawButton(15, 140, 76, 40, "+", BTN_UP_COLOR, true);
+        setResistance(currentResistance + 1); delay(150);
+        drawButton(15, 140, 76, 40, "+", BTN_UP_COLOR, false);
+      }
+      if (x > 15 && x < 91 && y > 190 && y < 230) {
+        beep(1500); drawButton(15, 190, 76, 40, "-", BTN_DOWN_COLOR, true);
+        setResistance(currentResistance - 1); delay(150);
+        drawButton(15, 190, 76, 40, "-", BTN_DOWN_COLOR, false);
+      }
+      if (x > 250 && y < 30) { beep(500, 100); setSleep(true); }
+    }
+    updateDashboard(connected ? "CONNECTED" : "DISCONNECTED");
+    if (currentMillis - lastActivityTime > SLEEP_TIMEOUT) setSleep(true);
+  }
+  delay(20);
 }
