@@ -1,17 +1,54 @@
+// --- Target Device Configuration ---
+// Uncomment the line below if you are using the 3.5-inch CYD with capacitive touch (ST7796 display + GT911 touch).
+// Keep it commented out if you are using the standard 2.8-inch CYD (ILI9341 display + XPT2046 touch).
+#define CYD_35_CAPACITIVE
+
 #include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
 
-// --- Hardware Pins ---
-#define XPT2046_IRQ  36
-#define XPT2046_MOSI 32
-#define XPT2046_MISO 39
-#define XPT2046_CLK  25
-#define XPT2046_CS   33
-#define BUZZER_PIN   26
-#define TFT_BL       21
+#ifdef CYD_35_CAPACITIVE
+  #include <Wire.h>
+  #include <TAMC_GT911.h>
+#else
+  #include <XPT2046_Touchscreen.h>
+#endif
+
+// --- Hardware Pins & Dimensions ---
+#ifdef CYD_35_CAPACITIVE
+  #define SCREEN_WIDTH 480
+  #define SCREEN_HEIGHT 320
+  #define TFT_BL 27
+  #define TS_SDA 33
+  #define TS_SCL 32
+  #define TS_INT 21
+  #define TS_RST 25
+  #define BUZZER_PIN 26
+#else
+  #define SCREEN_WIDTH 320
+  #define SCREEN_HEIGHT 240
+  #define TFT_BL 21
+  #define XPT2046_IRQ  36
+  #define XPT2046_MOSI 32
+  #define XPT2046_MISO 39
+  #define XPT2046_CLK  25
+  #define XPT2046_CS   33
+  #define BUZZER_PIN   26
+  #define TS_MINX 200
+  #define TS_MAXX 3700
+  #define TS_MINY 200
+  #define TS_MAXY 3600
+#endif
+
+// --- UI Scaling Macros ---
+#ifdef CYD_35_CAPACITIVE
+  #define SCALE_X(x) (((x) * 480) / 320)
+  #define SCALE_Y(y) (((y) * 320) / 240)
+#else
+  #define SCALE_X(x) (x)
+  #define SCALE_Y(y) (y)
+#endif
 
 // --- UI Constants ---
 #define COLOR_BG      TFT_BLACK
@@ -27,10 +64,6 @@
 #define BTN_DOWN_COLOR 0xA000 
 
 #define SLEEP_TIMEOUT  300000 
-#define TS_MINX 200
-#define TS_MAXX 3700
-#define TS_MINY 200
-#define TS_MAXY 3600
 
 // --- System State ---
 enum SystemState { STATE_SLEEP, STATE_DISCONNECTED, STATE_CONNECTED };
@@ -38,8 +71,13 @@ SystemState currentState = STATE_DISCONNECTED;
 unsigned long lastActivityTime = 0;
 
 TFT_eSPI tft = TFT_eSPI();
-SPIClass touchSPI = SPIClass(HSPI);
-XPT2046_Touchscreen touch(XPT2046_CS, XPT2046_IRQ);
+
+#ifdef CYD_35_CAPACITIVE
+  TAMC_GT911 touch = TAMC_GT911(TS_SDA, TS_SCL, TS_INT, TS_RST, SCREEN_WIDTH, SCREEN_HEIGHT);
+#else
+  SPIClass touchSPI = SPIClass(HSPI);
+  XPT2046_Touchscreen touch(XPT2046_CS, XPT2046_IRQ);
+#endif
 
 // --- Debug Flag ---
 #define UI_DEBUG 
@@ -98,42 +136,64 @@ void beep(int freq, int duration = 20) {
   tone(BUZZER_PIN, freq, duration);
 }
 
+// --- Unified Touch Input Handler ---
+bool checkTouch(uint16_t &x, uint16_t &y) {
+#ifdef CYD_35_CAPACITIVE
+  touch.read();
+  if (touch.isTouched && touch.touches > 0) {
+    // Map the 3.5" (480x320) touch coordinates back to 320x240 coordinates
+    // so the existing touch boundary checks work seamlessly.
+    x = (touch.points[0].x * 320) / 480;
+    y = (touch.points[0].y * 240) / 320;
+    return true;
+  }
+#else
+  if (touch.touched()) {
+    TS_Point p = touch.getPoint();
+    x = map(p.x, TS_MINX, TS_MAXX, 0, 320);
+    y = map(p.y, TS_MINY, TS_MAXY, 0, 240);
+    return true;
+  }
+#endif
+  return false;
+}
+
 void drawButton(int x, int y, int w, int h, String label, uint16_t color, bool pressed) {
   uint16_t fill = pressed ? TFT_WHITE : color;
   uint16_t text = pressed ? color : TFT_WHITE;
-  tft.fillRoundRect(x, y, w, h, 8, fill);
-  tft.drawRoundRect(x, y, w, h, 8, TFT_WHITE);
+  tft.fillRoundRect(SCALE_X(x), SCALE_Y(y), SCALE_X(w), SCALE_Y(h), 8, fill);
+  tft.drawRoundRect(SCALE_X(x), SCALE_Y(y), SCALE_X(w), SCALE_Y(h), 8, TFT_WHITE);
   tft.setTextColor(text);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString(label, x + (w/2), y + (h/2), 4);
+  tft.drawString(label, SCALE_X(x + (w/2)), SCALE_Y(y + (h/2)), 4);
 }
 
 void drawConnectScreen() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString("ECHELON CONSOLE", 160, 60, 4);
+  tft.drawString("ECHELON CONSOLE", SCALE_X(160), SCALE_Y(60), 4);
   drawButton(30, 110, 260, 70, "START WORKOUT", 0x001F, false); 
   tft.setTextColor(TFT_DARKGREY);
-  tft.drawString("Tap to connect to bike", 160, 200, 2);
+  tft.drawString("Tap to connect to bike", SCALE_X(160), SCALE_Y(200), 2);
 }
 
 void drawStaticUI() {
   tft.fillScreen(COLOR_BG);
-  tft.drawFastVLine(106, 40, 200, 0x4208); 
-  tft.drawFastVLine(212, 40, 200, 0x4208); 
+  tft.drawFastVLine(SCALE_X(106), SCALE_Y(40), SCALE_Y(200), 0x4208); 
+  tft.drawFastVLine(SCALE_X(212), SCALE_Y(40), SCALE_Y(200), 0x4208); 
   tft.setTextColor(COLOR_TEXT);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString("RESISTANCE", 53, 50, 2);
-  tft.drawString("CADENCE", 159, 50, 2);
-  tft.drawString("WATTS", 265, 50, 2);
-  tft.drawString("KCAL", 159, 160, 2);
-  tft.drawString("MILES", 265, 160, 2);
+  tft.drawString("RESISTANCE", SCALE_X(53), SCALE_Y(50), 2);
+  tft.drawString("CADENCE", SCALE_X(159), SCALE_Y(50), 2);
+  tft.drawString("WATTS", SCALE_X(265), SCALE_Y(50), 2);
+  tft.drawString("KCAL", SCALE_X(159), SCALE_Y(160), 2);
+  tft.drawString("MILES", SCALE_X(265), SCALE_Y(160), 2);
   drawButton(15, 140, 76, 40, "+", BTN_UP_COLOR, false);
   drawButton(15, 190, 76, 40, "-", BTN_DOWN_COLOR, false);
-  tft.fillRect(250, 2, 60, 26, TFT_RED);
+  tft.fillRect(SCALE_X(250), SCALE_Y(2), SCALE_X(60), SCALE_Y(26), TFT_RED);
   tft.setTextColor(TFT_WHITE);
-  tft.drawString("STOP", 280, 15, 2);
+  tft.drawString("STOP", SCALE_X(280), SCALE_Y(15), 2);
 }
 
 void updateDashboard(String statusMsg) {
@@ -148,12 +208,12 @@ void updateDashboard(String statusMsg) {
   String timeStr = String(tBuf);
 
   if (statusMsg != lastStatus || timeStr != lastTimeStr) {
-    tft.fillRect(0, 0, 248, 30, COLOR_PANEL); 
+    tft.fillRect(0, 0, SCALE_X(248), SCALE_Y(30), COLOR_PANEL); 
     tft.setTextColor(TFT_WHITE);
     tft.setTextDatum(ML_DATUM); 
-    tft.drawString(statusMsg, 10, 15, 2); 
+    tft.drawString(statusMsg, SCALE_X(10), SCALE_Y(15), 2); 
     tft.setTextDatum(MR_DATUM);
-    tft.drawString(timeStr, 240, 15, 2);
+    tft.drawString(timeStr, SCALE_X(240), SCALE_Y(15), 2);
     lastStatus = statusMsg;
     lastTimeStr = timeStr;
   }
@@ -162,36 +222,36 @@ void updateDashboard(String statusMsg) {
   tft.setTextDatum(MC_DATUM);
   
   if (currentResistance != lastResistance) {
-    tft.fillRect(5, 65, 96, 50, COLOR_BG);
+    tft.fillRect(SCALE_X(5), SCALE_Y(65), SCALE_X(96), SCALE_Y(50), COLOR_BG);
     tft.setTextColor(COLOR_RES);
-    tft.drawNumber(currentResistance, 53, 90, 7); 
+    tft.drawNumber(currentResistance, SCALE_X(53), SCALE_Y(90), 7); 
     lastResistance = currentResistance;
   }
   if (currentCadence != lastCadence) {
-    tft.fillRect(111, 65, 96, 50, COLOR_BG);
+    tft.fillRect(SCALE_X(111), SCALE_Y(65), SCALE_X(96), SCALE_Y(50), COLOR_BG);
     tft.setTextColor(COLOR_CAD);
-    tft.drawNumber(currentCadence, 159, 90, 7); 
+    tft.drawNumber(currentCadence, SCALE_X(159), SCALE_Y(90), 7); 
     lastCadence = currentCadence;
   }
   uint16_t wattsColor = getPowerColor(throttledWatts);
   if (throttledWatts != lastThrottledWatts || wattsColor != lastWattsColor) {
-    tft.fillRect(217, 65, 96, 50, COLOR_BG);
+    tft.fillRect(SCALE_X(217), SCALE_Y(65), SCALE_X(96), SCALE_Y(50), COLOR_BG);
     tft.setTextColor(wattsColor);
     int precision = (throttledWatts < 10.0) ? 1 : 0;
-    tft.drawFloat(throttledWatts, precision, 265, 90, 7); 
+    tft.drawFloat(throttledWatts, precision, SCALE_X(265), SCALE_Y(90), 7); 
     lastThrottledWatts = throttledWatts;
     lastWattsColor = wattsColor;
   }
   if (throttledKcals != lastKcals) {
-    tft.fillRect(110, 175, 98, 55, COLOR_BG);
+    tft.fillRect(SCALE_X(110), SCALE_Y(175), SCALE_X(98), SCALE_Y(55), COLOR_BG);
     tft.setTextColor(COLOR_KCAL);
-    tft.drawFloat(throttledKcals, (throttledKcals < 10.0 ? 1 : 0), 159, 205, 7); 
+    tft.drawFloat(throttledKcals, (throttledKcals < 10.0 ? 1 : 0), SCALE_X(159), SCALE_Y(205), 7); 
     lastKcals = throttledKcals;
   }
   if (throttledMiles != lastMiles) {
-    tft.fillRect(216, 175, 98, 55, COLOR_BG);
+    tft.fillRect(SCALE_X(216), SCALE_Y(175), SCALE_X(98), SCALE_Y(55), COLOR_BG);
     tft.setTextColor(COLOR_DIST);
-    tft.drawFloat(throttledMiles, (throttledMiles < 10.0 ? 2 : 1), 265, 205, 7); 
+    tft.drawFloat(throttledMiles, (throttledMiles < 10.0 ? 2 : 1), SCALE_X(265), SCALE_Y(205), 7); 
     lastMiles = throttledMiles;
   }
 }
@@ -274,10 +334,23 @@ bool connectToServer() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH); pinMode(BUZZER_PIN, OUTPUT);
-  tft.init(); tft.setRotation(1); drawConnectScreen();
+  pinMode(TFT_BL, OUTPUT); 
+  digitalWrite(TFT_BL, HIGH); 
+  pinMode(BUZZER_PIN, OUTPUT);
+  tft.init(); 
+  tft.setRotation(1); 
+  drawConnectScreen();
+
+#ifdef CYD_35_CAPACITIVE
+  Wire.begin(TS_SDA, TS_SCL);
+  touch.begin();
+  touch.setRotation(ROTATION_RIGHT);
+#else
   touchSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
-  touch.begin(touchSPI); touch.setRotation(1);
+  touch.begin(touchSPI); 
+  touch.setRotation(1);
+#endif
+
 #ifndef UI_DEBUG
   BLEDevice::init(""); pClient = BLEDevice::createClient(); pClient->setClientCallbacks(new MyClientCallback());
 #endif
@@ -287,13 +360,13 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
   if (currentState == STATE_SLEEP) {
-    if (touch.touched()) { beep(1000, 50); setSleep(false); delay(300); }
+    uint16_t tx, ty;
+    if (checkTouch(tx, ty)) { beep(1000, 50); setSleep(false); delay(300); }
     return; 
   }
   if (currentState == STATE_DISCONNECTED) {
-    if (touch.tirqTouched() && touch.touched()) {
-      TS_Point p = touch.getPoint();
-      uint16_t x = map(p.x, TS_MINX, TS_MAXX, 0, 320), y = map(p.y, TS_MINY, TS_MAXY, 0, 240);
+    uint16_t x, y;
+    if (checkTouch(x, y)) {
       if (x > 30 && x < 290 && y > 110 && y < 180) {
         beep(1500, 50);
 #ifdef UI_DEBUG
@@ -337,9 +410,8 @@ void loop() {
     lastPowerCalcTime = currentMillis;
     if (currentCadence > 0) lastActivityTime = currentMillis;
 
-    if (touch.tirqTouched() && touch.touched()) {
-      TS_Point p = touch.getPoint();
-      uint16_t x = map(p.x, TS_MINX, TS_MAXX, 0, 320), y = map(p.y, TS_MINY, TS_MAXY, 0, 240);
+    uint16_t x, y;
+    if (checkTouch(x, y)) {
       lastActivityTime = currentMillis;
       if (x > 15 && x < 91 && y > 140 && y < 180) {
         beep(2000); drawButton(15, 140, 76, 40, "+", BTN_UP_COLOR, true);
